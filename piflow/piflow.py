@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch
 from einops import rearrange
+torch.autograd.set_detect_anomaly(True)
 
 class PiFlow:
     """Take linear schedule"""
@@ -12,6 +13,7 @@ class PiFlow:
         self.teacher_model = teacher_model
         self.ln = ln
         self.NFE = NFE
+        self.DDIM_NFE = 100
 
         self.in_channels = student_model.in_channels
         self.input_size = student_model.input_size
@@ -21,27 +23,35 @@ class PiFlow:
         assert len(x_t.shape) == 4, f"x_t: {x_t.shape}"
         assert len(t.shape) == 1, f"t: {t.shape}"
 
-        # convert into q(x_0 | x_s)
-        x_t = x_t[:, None, :, :, :]
-        t = t[:, None, None, None, None]
-        mu_x = x_s - (1 - s) * mu_s
-        sigma_x = s * sigma_s
+        if (t.squeeze() == s.squeeze()).all():
+            x_0 = (A_s * mu_s).sum(dim=1, keepdim=True)
+            v_s = (x_s.squeeze(1) - x_0.squeeze(1)) / s.squeeze(1)
+            return v_s
+        
+        else:
+            assert (s.squeeze() - t.squeeze() > 0).all(), f"s - t: {s.squeeze() - t.squeeze()}"
 
-        # convert into q(x_0 | x_t), Appendix F
-        nu_x = s**2 * (1-t) * x_t - t**2 * (1-s) * x_s
-        xi_x = s**2 * (1-t)**2 - t**2 * (1-s)**2
+            # convert into q(x_0 | x_s)
+            x_t = x_t[:, None, :, :, :]
+            t = t[:, None, None, None, None]
+            mu_x = x_s - (1 - s) * mu_s
+            sigma_x = s * sigma_s
 
-        a_t = A_s.log() - 1/2 * F.mse_loss(
-            nu_x, xi_x*mu_x, reduction='none'
-        ).mean(dim=[-2,-1], keepdim=True) / (xi_x*s**2*t + xi_x**2*sigma_x**2)
+            # convert into q(x_0 | x_t), Appendix F
+            nu_x = s**2 * (1-t) * x_t - t**2 * (1-s) * x_s
+            xi_x = s**2 * (1-t)**2 - t**2 * (1-s)**2
 
-        A_t = a_t.softmax(dim=1)
-        mu_t = (sigma_x**2 * nu_x + s**2 * t**2 * mu_x) / (sigma_x**2 * xi_x + s**2 * t**2)
-        # sigma_t = ((sigma_x**2 * s**2 * t**2) / (sigma_x**2 * xi_x + s**2 * t**2)).sqrt()
+            a_t = A_s.log() - 1/2 * F.mse_loss(
+                nu_x, xi_x*mu_x, reduction='none'
+            ).mean(dim=[-2,-1], keepdim=True) / (xi_x*s**2*t + xi_x**2*sigma_x**2)
 
-        x_0 = (A_t * mu_t).sum(dim=1, keepdim=True)
-        v_t = (x_t.squeeze(1) - x_0.squeeze(1)) / t.squeeze(1)
-        return v_t
+            A_t = a_t.softmax(dim=1)
+            mu_t = (sigma_x**2 * nu_x + s**2 * t**2 * mu_x) / (sigma_x**2 * xi_x + s**2 * t**2)
+            # sigma_t = ((sigma_x**2 * s**2 * t**2) / (sigma_x**2 * xi_x + s**2 * t**2)).sqrt()
+
+            x_0 = (A_t * mu_t).sum(dim=1, keepdim=True)
+            v_t = (x_t.squeeze(1) - x_0.squeeze(1)) / t.squeeze(1)
+            return v_t
 
     def forward_fm(self, z0, cond):
         b = z0.size(0)
@@ -64,8 +74,8 @@ class PiFlow:
         """
         b = z0.size(0)
         s = torch.randint(1, self.NFE + 1, (b,)).to(z0.device) / self.NFE
-        t = s - 1 / self.NFE * torch.rand((b,)).to(z0.device)
-        t = t.clamp(1e-3, 1)
+        t = s - 1 / self.NFE * torch.rand((b,)).to(z0.device).clamp(self.DDIM_NFE*1e-3, 1-self.NFE*1e-3)
+        t = t.clamp(1e-6, 1)
         sexp = s.view([b, *([1] * len(z0.shape[1:]))])
         z1 = torch.randn_like(z0)
         zs = (1 - sexp) * z0 + sexp * z1
@@ -92,7 +102,7 @@ class PiFlow:
         return loss.mean()
 
     @torch.no_grad()
-    def from_s_to_t(self, x_s, s, t, cond, pi, NFE=50):
+    def from_s_to_t(self, x_s, s, t, cond, pi, NFE=25):
         dt = (s - t) / NFE
         assert (dt > 0).all(), f"dt < 0"
         for _ in range(NFE):
@@ -102,13 +112,13 @@ class PiFlow:
         return x_s
 
     @torch.no_grad()
-    def sample_fm(self, x_t, cond, sample_steps=50):
+    def sample_fm(self, x_t, cond):
         b = x_t.size(0)
-        dt = 1.0 / sample_steps
+        dt = 1.0 / self.DDIM_NFE
         dt = torch.tensor([dt] * b).to(x_t.device).view([b, *([1] * len(x_t.shape[1:]))])
         images = [x_t]
-        for i in range(sample_steps, 0, -1):
-            t = i / sample_steps
+        for i in range(self.DDIM_NFE, 0, -1):
+            t = i / self.DDIM_NFE
             t = torch.tensor([t] * b).to(x_t.device)
 
             v_t = self.teacher_model(x_t, t, cond)

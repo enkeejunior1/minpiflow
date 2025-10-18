@@ -335,7 +335,7 @@ class DiT_Llama(nn.Module):
             u = x[:, self.K:(1+self.out_channels)*self.K] # (N, out_channels * K, H, W)
             s = x[:, -1:].mean(dim=[1,2,3], keepdim=True) # (N, 1, 1, 1)
             return { # (N, K, C, H, W)
-                'A_s': A.reshape(shape_x[0], self.K, 1, *shape_x[2:]), # (N, K, 1, H, W)
+                'A_s': A.reshape(shape_x[0], self.K, 1, *shape_x[2:]).softmax(dim=1), # (N, K, 1, H, W)
                 'mu_s': u.reshape(shape_x[0], self.K, *shape_x[1:]),   # (N, K, C, H, W)
                 's': input_t[:, None, None, None, None], # (N, 1, 1, 1, 1)
                 'sigma_s': s[:, None, :, :, :],          # (N, 1, 1, 1, 1)
