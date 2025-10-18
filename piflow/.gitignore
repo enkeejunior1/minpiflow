@@ -5,3 +5,5 @@ wandb
 vae_mds
 ckpt
 flow
+weights/
+logs/

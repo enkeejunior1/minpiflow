@@ -339,7 +339,7 @@ class DiT_Llama(nn.Module):
                 'mu_s': u.reshape(shape_x[0], self.K, *shape_x[1:]),   # (N, K, C, H, W)
                 's': input_t[:, None, None, None, None], # (N, 1, 1, 1, 1)
                 'sigma_s': s[:, None, :, :, :],          # (N, 1, 1, 1, 1)
-                'x_s': input_x[:, None, :, :, :],        # (N, 1, 1, 1, 1)
+                'x_s': input_x[:, None, :, :, :],        # (N, 1, C, H, W)
             }
 
     def forward_with_cfg(self, x, t, y, cfg_scale):

@@ -43,16 +43,6 @@ class PiFlow:
         v_t = (x_t.squeeze(1) - x_0.squeeze(1)) / t.squeeze(1)
         return v_t
 
-    @torch.no_grad()
-    def from_s_to_t(self, x_s, s, t, cond, pi, NFE=50):
-        dt = (s - t) / NFE
-        assert (dt > 0).all(), f"dt < 0"
-        for _ in range(NFE):
-            v_s = pi(x_s, s, cond)
-            x_s = x_s - dt[:, None, None, None] * v_s
-            s = s - dt
-        return x_s
-
     def forward_fm(self, z0, cond):
         b = z0.size(0)
         if self.ln:
@@ -75,6 +65,7 @@ class PiFlow:
         b = z0.size(0)
         s = torch.randint(1, self.NFE + 1, (b,)).to(z0.device) / self.NFE
         t = s - 1 / self.NFE * torch.rand((b,)).to(z0.device)
+        t = t.clamp(1e-3, 1)
         sexp = s.view([b, *([1] * len(z0.shape[1:]))])
         z1 = torch.randn_like(z0)
         zs = (1 - sexp) * z0 + sexp * z1
@@ -101,6 +92,16 @@ class PiFlow:
         return loss.mean()
 
     @torch.no_grad()
+    def from_s_to_t(self, x_s, s, t, cond, pi, NFE=50):
+        dt = (s - t) / NFE
+        assert (dt > 0).all(), f"dt < 0"
+        for _ in range(NFE):
+            v_s = pi(x_s, s, cond)
+            x_s = x_s - dt[:, None, None, None] * v_s
+            s = s - dt
+        return x_s
+
+    @torch.no_grad()
     def sample_fm(self, x_t, cond, sample_steps=50):
         b = x_t.size(0)
         dt = 1.0 / sample_steps
@@ -125,7 +126,7 @@ class PiFlow:
         for i in range(self.NFE, 0, -1):
             t = s - dt
             params = self.student_model(x_s, s, cond)
-            pi = lambda x_t, t, cond: self.pi(x_t, t, s, cond, **params)
+            pi = lambda x_t, t, cond: self.pi(x_t, t, cond, **params)
             x_s = self.from_s_to_t(x_s, s, t, cond, pi)
             images.append(x_s)
             s = t
@@ -147,7 +148,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="use cifar?")
     parser.add_argument("--cifar", action="store_true")
-    parser.add_argument("--debug", action="store_true", default=False)
     args = parser.parse_args()
     CIFAR = args.cifar
 
@@ -198,28 +198,28 @@ if __name__ == "__main__":
     wandb.init(project=f"piflow_{dataset_name}")
 
     # train teacher model
-    if os.path.exists(f"weights/teacher_{dataset_name}.pth") and not args.debug:
+    if os.path.exists(f"weights/teacher_{dataset_name}.pth"):
         rf.teacher_model.load_state_dict(torch.load(f"weights/teacher_{dataset_name}.pth"))
     else:
-        epochs = 25 if not args.debug else 1
+        epochs = 25
         optimizer = optim.Adam(rf.teacher_model.parameters(), lr=5e-4)
-        for epoch in range(epochs):
-            for i, (x, c) in tqdm(enumerate(train_dl)):
+        for epoch in tqdm(range(epochs), desc="Training teacher model"):
+            for i, (x, c) in enumerate(train_dl):
                 x, c = x.cuda(), c.cuda()
                 optimizer.zero_grad()
                 loss = rf.forward_fm(x, c)
                 loss.backward()
                 optimizer.step()
                 wandb.log({"teacher_loss": loss.item()})
-                if args.debug:
-                    break
         torch.save(rf.teacher_model.state_dict(), f"weights/teacher_{dataset_name}.pth")
+    for p in rf.teacher_model.parameters():
+        p.requires_grad = False
 
     # train student model
-    epochs = 100 if not args.debug else 1
+    epochs = 100
     optimizer = optim.Adam(rf.student_model.parameters(), lr=5e-4)
-    for epoch in range(epochs):
-        for i, (x, c) in tqdm(enumerate(train_dl)):
+    for epoch in tqdm(range(epochs), desc="Training student model"):
+        for i, (x, c) in enumerate(train_dl):
             x, c = x.cuda(), c.cuda()
             optimizer.zero_grad()
             loss = rf.forward_pi_data_dependent(x, c)
@@ -227,9 +227,6 @@ if __name__ == "__main__":
             optimizer.step()
             wandb.log({"student_loss": loss.item()})
             
-            if args.debug:
-                break
-
         rf.student_model.eval()
         with torch.no_grad():
             cond = torch.arange(0, 16).cuda() % 10
