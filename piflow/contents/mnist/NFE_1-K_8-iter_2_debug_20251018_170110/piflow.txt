@@ -8,13 +8,14 @@ torch.autograd.set_detect_anomaly(True)
 
 class PiFlow:
     """Take linear schedule"""
-    def __init__(self, student_model, teacher_model, ln=True, NFE=4, DDIM_NFE=128, iter=2):
+    def __init__(self, student_model, teacher_model, ln=True, NFE=4, DDIM_NFE=128, iter=2, int_pi=False):
         self.student_model = student_model
         self.teacher_model = teacher_model
         self.ln = ln
         self.iter = iter
         self.NFE = NFE
         self.DDIM_NFE = DDIM_NFE
+        self.int_pi = int_pi
 
         self.in_channels = student_model.in_channels
         self.input_size = student_model.input_size
@@ -84,7 +85,7 @@ class PiFlow:
         loss = F.mse_loss(vtheta, z1 - z0)
         return loss.mean()
 
-    def forward_pi_data_dependent(self, z0=None, cond=None, iter=2, eps=1e-4, int_pi=False):
+    def forward_pi_data_dependent(self, z0=None, cond=None, iter=2, eps=1e-4):
         """
         Algorithm 2
         """
@@ -103,12 +104,16 @@ class PiFlow:
         loss = 0
         for iter_i in range(0, iter+1):
             t = s - 1 / self.NFE * (iter_i / iter)
-            t = t.clamp(eps, 1).to(z0.device)
+            t = t.clamp(2*eps, 1).to(z0.device)
             with torch.no_grad():
                 zt = self.from_s_to_t(zs, s, t, cond, pi_D)
                 vt = self.teacher_model(zt, t, cond)
-            # vtheta = pi(zt, t, cond) 
-            vtheta = self.int_pi_from_s_to_t(zt, t, t - 3/128, cond, pi) 
+            if self.int_pi:
+                t_dt = t - 3/128
+                t_dt = t_dt.clamp(eps, 1).to(z0.device)
+                vtheta = self.int_pi_from_s_to_t(zt, t, t_dt, cond, pi) 
+            else:
+                vtheta = pi(zt, t, cond) 
             loss = loss + F.mse_loss(vt, vtheta)
         loss = loss / (iter + 1)
         return loss
@@ -139,8 +144,8 @@ class PiFlow:
             return x_s
 
     def int_pi_from_s_to_t(self, x_s, s, t, cond, pi, NFE=64):
-        if (s == t).all():
-            return x_s
+        if (s - t <= 1e-3).all():
+            return pi(x_s, s, cond)
         else:
             dt = (s - t) / NFE
             assert (dt > 0).all(), f"dt < 0"
@@ -150,7 +155,8 @@ class PiFlow:
                 x_s = x_s - dt[:, None, None, None] * v_s
                 s = s - dt
                 int_v_s += v_s * dt[:, None, None, None]
-            return int_v_s / (s - t)
+            int_v_s = int_v_s / (s - t)
+            return int_v_s
 
     @torch.no_grad()
     def sample_fm(self, x_t, cond, DDIM_NFE=128):
@@ -202,9 +208,12 @@ if __name__ == "__main__":
     parser.add_argument("--K", type=int, default=8)
     parser.add_argument("--iter", type=int, default=2)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--int_pi", action="store_true")
     args = parser.parse_args()
 
     result_dir = f"contents/{args.dataset}/NFE_{args.NFE}-K_{args.K}-iter_{args.iter}"
+    if args.int_pi:
+        result_dir += f"-int_pi"
     if args.debug:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -256,7 +265,7 @@ if __name__ == "__main__":
             channels, 32, dim=64, n_layers=6, n_heads=4, num_classes=10, K=args.K, patch_size=patch_size
         ).cuda()
 
-    rf = PiFlow(student_model, teacher_model, NFE=args.NFE, iter=args.iter)
+    rf = PiFlow(student_model, teacher_model, NFE=args.NFE, iter=args.iter, int_pi=args.int_pi)
     train_ds = fdatasets(root="./data", train=True, download=True, transform=transform)
     train_dl = DataLoader(train_ds, batch_size=256, shuffle=True, drop_last=True)
 
@@ -288,7 +297,7 @@ if __name__ == "__main__":
 
     # train student model
     epochs = 100
-    optimizer = optim.Adam(rf.student_model.parameters(), lr=5e-5)
+    optimizer = optim.Adam(rf.student_model.parameters(), lr=5e-4)
     for epoch in tqdm(range(epochs), desc="Training student model"):
         for i, (x, c) in enumerate(train_dl):
             x, c = x.cuda(), c.cuda()
