@@ -22,4 +22,4 @@ echo "Job ID: $SLURM_JOB_ID"
 
 # python3 piflow.py --dataset cifar --NFE 4 --K 8
 # python3 piflow.py --dataset mnist --NFE 4 --K 8 --iter 8 --debug
-python3 piflow.py --dataset mnist --NFE 1 --K 8 --iter 8 --debug
+python3 piflow.py --dataset mnist --NFE 1 --K 8 --iter 32 --debug

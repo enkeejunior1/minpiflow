@@ -8,14 +8,13 @@ torch.autograd.set_detect_anomaly(True)
 
 class PiFlow:
     """Take linear schedule"""
-    def __init__(self, student_model, teacher_model, ln=True, NFE=4, DDIM_NFE=128, iter=2, int_pi=False):
+    def __init__(self, student_model, teacher_model, ln=True, NFE=4, DDIM_NFE=128, iter=2):
         self.student_model = student_model
         self.teacher_model = teacher_model
         self.ln = ln
         self.iter = iter
         self.NFE = NFE
         self.DDIM_NFE = DDIM_NFE
-        self.int_pi = int_pi
 
         self.in_channels = student_model.in_channels
         self.input_size = student_model.input_size
@@ -85,7 +84,7 @@ class PiFlow:
         loss = F.mse_loss(vtheta, z1 - z0)
         return loss.mean()
 
-    def forward_pi_data_dependent(self, z0=None, cond=None, iter=2, eps=1e-4):
+    def forward_pi_data_dependent(self, z0=None, cond=None, iter=2, eps=1e-4, int_pi=False):
         """
         Algorithm 2
         """
@@ -109,10 +108,7 @@ class PiFlow:
                 zt = self.from_s_to_t(zs, s, t, cond, pi_D)
                 vt = self.teacher_model(zt, t, cond)
             # vtheta = pi(zt, t, cond) 
-            if self.int_pi:
-                vtheta = self.int_pi_from_s_to_t(zt, t, t - 3/128, cond, pi) 
-            else:
-                vtheta = pi(zt, t, cond) 
+            vtheta = self.int_pi_from_s_to_t(zt, t, t - 3/128, cond, pi) 
             loss = loss + F.mse_loss(vt, vtheta)
         loss = loss / (iter + 1)
         return loss
@@ -206,12 +202,9 @@ if __name__ == "__main__":
     parser.add_argument("--K", type=int, default=8)
     parser.add_argument("--iter", type=int, default=2)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--int_pi", action="store_true")
     args = parser.parse_args()
 
     result_dir = f"contents/{args.dataset}/NFE_{args.NFE}-K_{args.K}-iter_{args.iter}"
-    if args.int_pi:
-        result_dir += f"-int_pi"
     if args.debug:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -295,7 +288,7 @@ if __name__ == "__main__":
 
     # train student model
     epochs = 100
-    optimizer = optim.Adam(rf.student_model.parameters(), lr=5e-4)
+    optimizer = optim.Adam(rf.student_model.parameters(), lr=5e-5)
     for epoch in tqdm(range(epochs), desc="Training student model"):
         for i, (x, c) in enumerate(train_dl):
             x, c = x.cuda(), c.cuda()

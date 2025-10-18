@@ -206,11 +206,11 @@ class TransformerBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, bias=False):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(
-            hidden_size, patch_size * patch_size * out_channels, bias=False
+            hidden_size, patch_size * patch_size * out_channels, bias=bias
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -218,7 +218,8 @@ class FinalLayer(nn.Module):
         )
         # # init zero
         nn.init.constant_(self.linear.weight, 0)
-        # nn.init.constant_(self.linear.bias, 0)
+        if bias:
+            nn.init.constant_(self.linear.bias, 0)
 
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
@@ -279,9 +280,9 @@ class DiT_Llama(nn.Module):
             ]
         )
         if self.K is not None:
-            self.final_layer_A = FinalLayer(dim, patch_size, self.K)
-            self.final_layer_u = FinalLayer(dim, patch_size, self.K * self.out_channels)
-            self.final_layer_s = FinalLayer(dim, patch_size, 1)
+            self.final_layer_A = FinalLayer(dim, patch_size, self.K, bias=True)
+            self.final_layer_u = FinalLayer(dim, patch_size, self.K * self.out_channels, bias=True)
+            self.final_layer_s = FinalLayer(dim, patch_size, 1, bias=True)
         else:
             self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
         self.freqs_cis = DiT_Llama.precompute_freqs_cis(dim // n_heads, 4096)
@@ -342,7 +343,7 @@ class DiT_Llama(nn.Module):
             A = A.reshape(shape_x[0], self.K, 1, *shape_x[2:]).softmax(dim=1) # (N, K, 1, H, W)
             u = rearrange(u, 'n (c k) h w -> n k c h w', k=self.K, c=C, h=H, w=W) # (N, K, C, H, W)
             s = rearrange(s, 'n 1 h w -> n 1 1 h w').mean(dim=[-2,-1], keepdim=True) # (N, 1, 1, 1, 1)
-            s = F.softplus(s) + 1e-6 # (N, 1, 1, 1, 1)
+            s = F.softplus(s) # (N, 1, 1, 1, 1)
 
             # (N, K, C, H, W)
             return { 
