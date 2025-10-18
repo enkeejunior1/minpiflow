@@ -8,18 +8,17 @@ torch.autograd.set_detect_anomaly(True)
 
 class PiFlow:
     """Take linear schedule"""
-    def __init__(self, student_model, teacher_model, ln=True, NFE=1):
+    def __init__(self, student_model, teacher_model, ln=True, NFE=4):
         self.student_model = student_model
         self.teacher_model = teacher_model
         self.ln = ln
         self.NFE = NFE
-        self.DDIM_NFE = 100
 
         self.in_channels = student_model.in_channels
         self.input_size = student_model.input_size
 
     def pi(self, x_t, t, *args, A_s=None, mu_s=None, sigma_s=None, x_s=None, s=None, **kwargs):
-        """Based on Gaussian-mixture model parameters from x_s, return v_t"""
+        """Based on Gaussian-mixture model parameters from x_s, return v_t | Appendix F"""
         assert len(A_s.shape) == len(mu_s.shape) == len(sigma_s.shape) == len(x_s.shape) == len(s.shape) == 5, f"A_s: {A_s.shape}, mu_s: {mu_s.shape}, sigma_s: {sigma_s.shape}, x_s: {x_s.shape}, s: {s.shape}"
         assert len(x_t.shape) == 4, f"x_t: {x_t.shape}"
         assert len(t.shape) == 1, f"t: {t.shape}"
@@ -44,7 +43,7 @@ class PiFlow:
 
             a_t = A_s.log() - 1/2 * F.mse_loss(
                 nu_x, xi_x*mu_x, reduction='none'
-            ).mean(dim=[-2,-1], keepdim=True) / (xi_x*s**2*t + xi_x**2*sigma_x**2)
+            ).mean(dim=[-2,-1], keepdim=True) / (xi_x * s**2 * t + xi_x**2 * sigma_x**2 + 1e-6) # numerical stability 
 
             A_t = a_t.softmax(dim=1)
             mu_t = (sigma_x**2 * nu_x + s**2 * t**2 * mu_x) / (sigma_x**2 * xi_x + s**2 * t**2)
@@ -68,29 +67,36 @@ class PiFlow:
         loss = F.mse_loss(vtheta, z1 - z0)
         return loss.mean()
 
-    def forward_pi_data_dependent(self, z0=None, cond=None):
+    def forward_pi_data_dependent(self, z0=None, cond=None, iter=64):
         """Algorithm 2
         s: start time
         t: end time
         """
         b = z0.size(0)
         s = torch.randint(1, self.NFE + 1, (b,)).to(z0.device) / self.NFE
-        t = s - 1 / self.NFE * torch.rand(
-            (b,)
-        ).clamp((self.DDIM_NFE//self.NFE)*1e-3, 1).to(z0.device)
         sexp = s.view([b, *([1] * len(z0.shape[1:]))])
+
         z1 = torch.randn_like(z0)
         zs = (1 - sexp) * z0 + sexp * z1
-        params = self.student_model(zs, s, cond)
-
-        pi = lambda x_t, t, cond: self.pi(x_t, t, cond, **params)
-        zt = self.from_s_to_t(zs, s, t, cond, pi)
-        with torch.no_grad():
-            vt = self.teacher_model(zt, t, cond).detach()
         
-        vtheta = pi(zt.detach(), t, cond)
-        loss = F.mse_loss(vt, vtheta)
-        return loss.mean()
+        params = self.student_model(zs, s, cond)
+        pi = lambda x_t, t, cond: self.pi(x_t, t, cond, **params)
+        params_D = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in params.items()}
+        pi_D = lambda x_t, t, cond: self.pi(x_t, t, cond, **params_D)
+
+        loss = 0
+        for _ in range(iter):
+            t = s - 1 / self.NFE * torch.rand(
+                (b,)
+            ).clamp(1e-1, 1).to(z0.device)
+
+            with torch.no_grad():
+                zt = self.from_s_to_t(zs, s, t, cond, pi_D)
+                vt = self.teacher_model(zt, t, cond)
+            vtheta = pi(zt, t, cond)
+            loss = loss + F.mse_loss(vt, vtheta)
+        loss = loss / iter
+        return loss
 
     def forward_pi_data_free(self, z0=None, cond=None):
         """Algorithm 3"""
@@ -104,7 +110,7 @@ class PiFlow:
         return loss.mean()
 
     @torch.no_grad()
-    def from_s_to_t(self, x_s, s, t, cond, pi, NFE=25):
+    def from_s_to_t(self, x_s, s, t, cond, pi, NFE=64):
         dt = (s - t) / NFE
         assert (dt > 0).all(), f"dt < 0"
         for _ in range(NFE):
@@ -114,15 +120,14 @@ class PiFlow:
         return x_s
 
     @torch.no_grad()
-    def sample_fm(self, x_t, cond):
+    def sample_fm(self, x_t, cond, DDIM_NFE=128):
         b = x_t.size(0)
-        dt = 1.0 / self.DDIM_NFE
+        dt = 1.0 / DDIM_NFE
         dt = torch.tensor([dt] * b).to(x_t.device).view([b, *([1] * len(x_t.shape[1:]))])
         images = [x_t]
-        for i in range(self.DDIM_NFE, 0, -1):
-            t = i / self.DDIM_NFE
+        for i in range(DDIM_NFE, 0, -1):
+            t = i / DDIM_NFE
             t = torch.tensor([t] * b).to(x_t.device)
-
             v_t = self.teacher_model(x_t, t, cond)
             x_t = x_t - dt * v_t
             images.append(x_t)
@@ -135,7 +140,7 @@ class PiFlow:
         images = [x_s]
         
         s = torch.ones((b,)).to(x_s.device)
-        for i in range(self.NFE, 0, -1):
+        for _ in range(self.NFE, 0, -1):
             t = s - dt
             params = self.student_model(x_s, s, cond)
             pi = lambda x_t, t, cond: self.pi(x_t, t, cond, **params)
@@ -204,7 +209,7 @@ if __name__ == "__main__":
             channels, 32, dim=256, n_layers=10, n_heads=8, num_classes=10, K=args.K
         ).cuda()
 
-    rf = PiFlow(student_model, teacher_model, NFE=1)
+    rf = PiFlow(student_model, teacher_model, NFE=args.NFE)
     train_ds = fdatasets(root="./data", train=True, download=True, transform=transform)
     train_dl = DataLoader(train_ds, batch_size=256, shuffle=True, drop_last=True)
 
@@ -237,6 +242,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             loss = rf.forward_pi_data_dependent(x, c)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(rf.student_model.parameters(), 1e0)
             optimizer.step()
             wandb.log({"student_loss": loss.item()})
             
