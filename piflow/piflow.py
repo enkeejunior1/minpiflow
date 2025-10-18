@@ -8,7 +8,7 @@ torch.autograd.set_detect_anomaly(True)
 
 class PiFlow:
     """Take linear schedule"""
-    def __init__(self, student_model, teacher_model, ln=True, NFE=4):
+    def __init__(self, student_model, teacher_model, ln=True, NFE=1):
         self.student_model = student_model
         self.teacher_model = teacher_model
         self.ln = ln
@@ -19,6 +19,7 @@ class PiFlow:
         self.input_size = student_model.input_size
 
     def pi(self, x_t, t, *args, A_s=None, mu_s=None, sigma_s=None, x_s=None, s=None, **kwargs):
+        """Based on Gaussian-mixture model parameters from x_s, return v_t"""
         assert len(A_s.shape) == len(mu_s.shape) == len(sigma_s.shape) == len(x_s.shape) == len(s.shape) == 5, f"A_s: {A_s.shape}, mu_s: {mu_s.shape}, sigma_s: {sigma_s.shape}, x_s: {x_s.shape}, s: {s.shape}"
         assert len(x_t.shape) == 4, f"x_t: {x_t.shape}"
         assert len(t.shape) == 1, f"t: {t.shape}"
@@ -74,8 +75,9 @@ class PiFlow:
         """
         b = z0.size(0)
         s = torch.randint(1, self.NFE + 1, (b,)).to(z0.device) / self.NFE
-        t = s - 1 / self.NFE * torch.rand((b,)).to(z0.device).clamp(self.DDIM_NFE*1e-3, 1-self.NFE*1e-3)
-        t = t.clamp(1e-6, 1)
+        t = s - 1 / self.NFE * torch.rand(
+            (b,)
+        ).clamp((self.DDIM_NFE//self.NFE)*1e-3, 1).to(z0.device)
         sexp = s.view([b, *([1] * len(z0.shape[1:]))])
         z1 = torch.randn_like(z0)
         zs = (1 - sexp) * z0 + sexp * z1
@@ -157,15 +159,17 @@ if __name__ == "__main__":
     from dit import DiT_Llama
 
     parser = argparse.ArgumentParser(description="use cifar?")
-    parser.add_argument("--cifar", action="store_true")
+    parser.add_argument("--dataset", type=str, default="mnist")
+    parser.add_argument("--NFE", type=int, default=4)
+    parser.add_argument("--K", type=int, default=8)
     args = parser.parse_args()
-    CIFAR = args.cifar
 
-    os.makedirs("weights", exist_ok=True)
-    os.makedirs("contents", exist_ok=True)
+    result_dir = f"contents/{args.dataset}/NFE_{args.NFE}-K_{args.K}"
+    weight_dir = f"weights/{args.dataset}"
+    os.makedirs(weight_dir, exist_ok=True)
+    os.makedirs(result_dir, exist_ok=True)
 
-    if CIFAR:
-        dataset_name = "cifar"
+    if args.dataset == "cifar":
         fdatasets = datasets.CIFAR10
         transform = transforms.Compose(
             [
@@ -180,11 +184,10 @@ if __name__ == "__main__":
             channels, 32, dim=256, n_layers=10, n_heads=8, num_classes=10
         ).cuda()
         student_model = DiT_Llama(
-            channels, 32, dim=256, n_layers=10, n_heads=8, num_classes=10, K=8
+            channels, 32, dim=256, n_layers=10, n_heads=8, num_classes=10, K=args.K
         ).cuda()
 
-    else:
-        dataset_name = "mnist"
+    elif args.dataset == "mnist":
         fdatasets = datasets.MNIST
         transform = transforms.Compose(
             [
@@ -198,18 +201,18 @@ if __name__ == "__main__":
             channels, 32, dim=64, n_layers=6, n_heads=4, num_classes=10
         ).cuda()
         student_model = DiT_Llama(
-            channels, 32, dim=64, n_layers=6, n_heads=4, num_classes=10, K=8
+            channels, 32, dim=256, n_layers=10, n_heads=8, num_classes=10, K=args.K
         ).cuda()
 
-    rf = PiFlow(student_model, teacher_model, NFE=4)
+    rf = PiFlow(student_model, teacher_model, NFE=1)
     train_ds = fdatasets(root="./data", train=True, download=True, transform=transform)
     train_dl = DataLoader(train_ds, batch_size=256, shuffle=True, drop_last=True)
 
-    wandb.init(project=f"piflow_{dataset_name}")
+    wandb.init(project=f"piflow_{args.dataset}")
 
     # train teacher model
-    if os.path.exists(f"weights/teacher_{dataset_name}.pth"):
-        rf.teacher_model.load_state_dict(torch.load(f"weights/teacher_{dataset_name}.pth"))
+    if os.path.exists(f"{weight_dir}/teacher.pth"):
+        rf.teacher_model.load_state_dict(torch.load(f"{weight_dir}/teacher.pth"))
     else:
         epochs = 25
         optimizer = optim.Adam(rf.teacher_model.parameters(), lr=5e-4)
@@ -221,7 +224,7 @@ if __name__ == "__main__":
                 loss.backward()
                 optimizer.step()
                 wandb.log({"teacher_loss": loss.item()})
-        torch.save(rf.teacher_model.state_dict(), f"weights/teacher_{dataset_name}.pth")
+        torch.save(rf.teacher_model.state_dict(), f"{weight_dir}/teacher.pth")
     for p in rf.teacher_model.parameters():
         p.requires_grad = False
 
@@ -257,7 +260,7 @@ if __name__ == "__main__":
                 gif.append(Image.fromarray(img))
 
             gif[0].save(
-                f"contents/sample_{epoch}_pi.gif",
+                f"{result_dir}/sample_{epoch}_pi.gif",
                 save_all=True,
                 append_images=gif[1:],
                 duration=100,
@@ -265,7 +268,7 @@ if __name__ == "__main__":
             )
 
             last_img = gif[-1]
-            last_img.save(f"contents/sample_{epoch}_pi_last.png")
+            last_img.save(f"{result_dir}/sample_{epoch}_pi_last.png")
 
             # >>> teacher model with NFE = 4
             images = rf.sample_fm(x_T, cond)
@@ -280,7 +283,7 @@ if __name__ == "__main__":
                 gif.append(Image.fromarray(img))
 
             gif[0].save(
-                f"contents/sample_{epoch}_fm.gif",
+                f"{result_dir}/sample_{epoch}_fm.gif",
                 save_all=True,
                 append_images=gif[1:],
                 duration=100,
@@ -288,7 +291,7 @@ if __name__ == "__main__":
             )
 
             last_img = gif[-1]
-            last_img.save(f"contents/sample_{epoch}_fm_last.png")
+            last_img.save(f"{result_dir}/sample_{epoch}_fm_last.png")
 
         rf.student_model.train()
         
