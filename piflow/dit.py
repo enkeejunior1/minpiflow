@@ -240,6 +240,7 @@ class DiT_Llama(nn.Module):
         norm_eps=1e-5,
         class_dropout_prob=0.1,
         num_classes=10,
+        K=None,
     ):
         super().__init__()
 
@@ -247,6 +248,7 @@ class DiT_Llama(nn.Module):
         self.out_channels = in_channels
         self.input_size = input_size
         self.patch_size = patch_size
+        self.K = K
 
         self.init_conv_seq = nn.Sequential(
             nn.Conv2d(in_channels, dim // 2, kernel_size=5, padding=2, stride=1),
@@ -259,7 +261,6 @@ class DiT_Llama(nn.Module):
 
         self.x_embedder = nn.Linear(patch_size * patch_size * dim // 2, dim, bias=True)
         nn.init.constant_(self.x_embedder.bias, 0)
-
         self.t_embedder = TimestepEmbedder(min(dim, 1024))
         self.y_embedder = LabelEmbedder(num_classes, min(dim, 1024), class_dropout_prob)
 
@@ -276,17 +277,19 @@ class DiT_Llama(nn.Module):
                 for layer_id in range(n_layers)
             ]
         )
-        self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
-
+        if self.K is not None:
+            self.final_layer = FinalLayer(dim, patch_size, (self.out_channels + 1) * self.K + 1)
+        else:
+            self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
         self.freqs_cis = DiT_Llama.precompute_freqs_cis(dim // n_heads, 4096)
 
     def unpatchify(self, x):
         c = self.out_channels
         p = self.patch_size
         h = w = int(x.shape[1] ** 0.5)
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, -1))
         x = torch.einsum("nhwpqc->nchpwq", x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], -1, h * p, h * p))
         return imgs
 
     def patchify(self, x):
@@ -304,9 +307,11 @@ class DiT_Llama(nn.Module):
 
     def forward(self, x, t, y):
         self.freqs_cis = self.freqs_cis.to(x.device)
+        input_t = t.clone().detach()
+        input_x = x.clone().detach()
+        shape_x = x.shape
 
         x = self.init_conv_seq(x)
-
         x = self.patchify(x)
         x = self.x_embedder(x)
 
@@ -317,10 +322,25 @@ class DiT_Llama(nn.Module):
         for layer in self.layers:
             x = layer(x, self.freqs_cis[: x.size(1)], adaln_input=adaln_input)
 
-        x = self.final_layer(x, adaln_input)
-        x = self.unpatchify(x)  # (N, out_channels, H, W)
+        if self.K is None:
+            x = self.final_layer(x, adaln_input)
+            x = self.unpatchify(x)
+            return x
+        
+        else:
+            x = self.final_layer(x, adaln_input)
+            x = self.unpatchify(x) # (N, (out_channels + 1) * K + 1, H, W)
 
-        return x
+            A = x[:, :self.K] # (N, 1*K, H, W)
+            u = x[:, self.K:(1+self.out_channels)*self.K] # (N, out_channels * K, H, W)
+            s = x[:, -1:].mean(dim=[1,2,3], keepdim=True) # (N, 1, 1, 1)
+            return { # (N, K, C, H, W)
+                'A_s': A.reshape(shape_x[0], self.K, 1, *shape_x[2:]), # (N, K, 1, H, W)
+                'mu_s': u.reshape(shape_x[0], self.K, *shape_x[1:]),   # (N, K, C, H, W)
+                's': input_t[:, None, None, None, None], # (N, 1, 1, 1, 1)
+                'sigma_s': s[:, None, :, :, :],          # (N, 1, 1, 1, 1)
+                'x_s': input_x[:, None, :, :, :],        # (N, 1, 1, 1, 1)
+            }
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         half = x[: len(x) // 2]

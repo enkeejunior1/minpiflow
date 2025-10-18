@@ -1,8 +1,60 @@
 # implementation of Rectified Flow for simple minded people like me.
 import argparse
-
+import torch.nn.functional as F
+import torch.nn as nn
 import torch
+from einops import rearrange
 
+class PiFlow:
+    def __init__(self, student_model, teacher_model, ln=True):
+        self.student_model = student_model
+        self.teacher_model = teacher_model
+        self.ln = ln
+        self.in_channels = student_model.in_channels
+        self.input_size = student_model.input_size
+
+    def forward(self, z0, cond):
+        b = z0.size(0)
+        if self.ln:
+            nt = torch.randn((b,)).to(z0.device)
+            t = torch.sigmoid(nt)
+        else:
+            t = torch.rand((b,)).to(z0.device)
+        texp = t.view([b, *([1] * len(z0.shape[1:]))])
+        z1 = torch.randn_like(z0)
+        zt = (1 - texp) * z0 + texp * z1
+        
+        v = z1 - z0
+        k, u, s = self.student_model(zt, t, cond) # (N, K, H, W), (N, out_channels * K, H, W), (N, 1)
+        v = rearrange(v, 'b c h w -> b () c (h w)')
+        u = rearrange(u, 'b (k c) h w -> b k c (h w)', c=self.in_channels)
+        k = rearrange(k, 'b k h w -> b k (h w)').softmax(dim=-1)
+        s = rearrange(s, 'b 1 -> b () 1')
+        loss = -torch.logsumexp(
+            -F.mse_loss(v, u, reduction='none').mean(dim=[2, 3]) / (2 * s**2) 
+            -self.input_size**2 * torch.log(s) + torch.log(k),
+            dim=1,
+        )
+        return loss.mean()
+
+    @torch.no_grad()
+    def sample(self, z, cond, null_cond=None, sample_steps=50, cfg=2.0):
+        b = z.size(0)
+        dt = 1.0 / sample_steps
+        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
+        images = [z]
+        for i in range(sample_steps, 0, -1):
+            t = i / sample_steps
+            t = torch.tensor([t] * b).to(z.device)
+
+            vc = self.model(z, t, cond)
+            if null_cond is not None:
+                vu = self.model(z, t, null_cond)
+                vc = vu + cfg * (vc - vu)
+
+            z = z - dt * vc
+            images.append(z)
+        return images
 
 class RF:
     def __init__(self, model, ln=True):
