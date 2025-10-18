@@ -6,6 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 
 def modulate(x, shift, scale):
@@ -209,7 +210,7 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(
-            hidden_size, patch_size * patch_size * out_channels, bias=True
+            hidden_size, patch_size * patch_size * out_channels, bias=False
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -217,7 +218,7 @@ class FinalLayer(nn.Module):
         )
         # # init zero
         nn.init.constant_(self.linear.weight, 0)
-        nn.init.constant_(self.linear.bias, 0)
+        # nn.init.constant_(self.linear.bias, 0)
 
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
@@ -278,7 +279,9 @@ class DiT_Llama(nn.Module):
             ]
         )
         if self.K is not None:
-            self.final_layer = FinalLayer(dim, patch_size, (self.out_channels + 1) * self.K + 1)
+            self.final_layer_A = FinalLayer(dim, patch_size, self.K)
+            self.final_layer_u = FinalLayer(dim, patch_size, self.K * self.out_channels)
+            self.final_layer_s = FinalLayer(dim, patch_size, 1)
         else:
             self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
         self.freqs_cis = DiT_Llama.precompute_freqs_cis(dim // n_heads, 4096)
@@ -310,6 +313,7 @@ class DiT_Llama(nn.Module):
         input_t = t.clone().detach()
         input_x = x.clone().detach()
         shape_x = x.shape
+        B, C, H, W = shape_x
 
         x = self.init_conv_seq(x)
         x = self.patchify(x)
@@ -328,17 +332,24 @@ class DiT_Llama(nn.Module):
             return x
         
         else:
-            x = self.final_layer(x, adaln_input)
-            x = self.unpatchify(x) # (N, (out_channels + 1) * K + 1, H, W)
+            A = self.final_layer_A(x, adaln_input)
+            u = self.final_layer_u(x, adaln_input)
+            s = self.final_layer_s(x, adaln_input)
+            A = self.unpatchify(A) # (N, K, H, W)
+            u = self.unpatchify(u) # (N, C * K, H, W)
+            s = self.unpatchify(s) # (N, 1, H, W)
 
-            A = x[:, :self.K] # (N, 1*K, H, W)
-            u = x[:, self.K:(1+self.out_channels)*self.K] # (N, out_channels * K, H, W)
-            s = x[:, -1:].mean(dim=[1,2,3], keepdim=True) # (N, 1, 1, 1)
-            return { # (N, K, C, H, W)
-                'A_s': A.reshape(shape_x[0], self.K, 1, *shape_x[2:]).softmax(dim=1), # (N, K, 1, H, W)
-                'mu_s': u.reshape(shape_x[0], self.K, *shape_x[1:]),   # (N, K, C, H, W)
+            A = A.reshape(shape_x[0], self.K, 1, *shape_x[2:]).softmax(dim=1) # (N, K, 1, H, W)
+            u = rearrange(u, 'n (c k) h w -> n k c h w', k=self.K, c=C, h=H, w=W) # (N, K, C, H, W)
+            s = rearrange(s, 'n 1 h w -> n 1 1 h w').mean(dim=[-2,-1], keepdim=True) # (N, 1, 1, 1, 1)
+            s = F.softplus(s) + 1e-6 # (N, 1, 1, 1, 1)
+
+            # (N, K, C, H, W)
+            return { 
+                'A_s': A,                                # (N, K, 1, H, W)
+                'mu_s': u,                               # (N, K, C, H, W)
+                'sigma_s': s,                            # (N, 1, 1, 1, 1)
                 's': input_t[:, None, None, None, None], # (N, 1, 1, 1, 1)
-                'sigma_s': s[:, None, :, :, :],          # (N, 1, 1, 1, 1)
                 'x_s': input_x[:, None, :, :, :],        # (N, 1, C, H, W)
             }
 
