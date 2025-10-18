@@ -20,5 +20,5 @@ echo "Job started at $(date)"
 echo "Running on node: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
 
-python3 piflow.py --dataset mnist --NFE 1 --K 8 --iter 2 --debug 
-python3 piflow.py --dataset cifar --NFE 4 --K 8 --iter 2 --debug 
+python3 piflow.py --dataset mnist --NFE 1 --K 8 --iter 2 
+python3 piflow.py --dataset cifar --NFE 4 --K 8 --iter 2 
